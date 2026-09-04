@@ -126,7 +126,7 @@
   .tray-note { font-size: 14px; color: #8A8478; margin: 0; }
 
   .heat-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
-  .heat-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .heat-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; padding: 0; background: none; border: none; }
   .heat-sq { width: 100%; aspect-ratio: 1 / 1; border-radius: 8px; }
   .heat-sq.today { outline: 2px solid var(--ink); outline-offset: 2px; }
   .heat-day { font-size: 9px; color: var(--muted-2); }
@@ -191,12 +191,20 @@
   };
 
   // ---------- date/time helpers ----------
-  function todayStr() { return new Date().toISOString().slice(0, 10); }
-  function daysAgoStr(n) { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); }
+  function localDateStr(date) {
+    const d = date || new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+  function todayStr() { return localDateStr(); }
+  function daysAgoStr(n) { const d = new Date(); d.setDate(d.getDate() - n); return localDateStr(d); }
   function fmtDate(s) { const d = new Date(s + 'T00:00:00'); return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }); }
-  function dateKeyOf(iso) { return iso.slice(0, 10); }
+  function dateKeyOf(iso) { return localDateStr(new Date(iso)); }
   function hhmmOf(iso) { const d = new Date(iso); return d.toTimeString().slice(0, 5); }
   function combineTodayTime(hhmm) { const now = new Date(); const [h, m] = hhmm.split(':').map(Number); now.setHours(h, m, 0, 0); return now.toISOString(); }
+  function combineDateTime(dateStr, hhmm) { const d = new Date(dateStr + 'T00:00:00'); const [h, m] = hhmm.split(':').map(Number); d.setHours(h, m, 0, 0); return d.toISOString(); }
   function fmtTime(iso) { const d = new Date(iso); return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }); }
   function durationHours(a, b) { return (new Date(b) - new Date(a)) / 3600000; }
   function uid() { return Math.random().toString(36).slice(2, 9); }
@@ -225,7 +233,10 @@
     loading: true,
     saveError: false,
     showSettings: false,
+    showBackfill: false,
     editingSession: null, // null | 'new' | session object
+    newSessionDate: null, // dateKey to default a new session to, or null for today
+    viewingDay: null, // dateKey currently open in the day-detail sheet, or null
     now: new Date().toISOString()
   };
 
@@ -307,8 +318,41 @@
     persist(next);
   }
 
+  function runBackfill(fromStr, toStr, hoursPerDay) {
+    if (!fromStr || !toStr) return;
+    const from = new Date(fromStr + 'T00:00:00');
+    const to = new Date(toStr + 'T00:00:00');
+    if (from > to) return;
+    const next = JSON.parse(JSON.stringify(state.data));
+    const h = Math.max(1, Math.min(23, Math.round(hoursPerDay)));
+    const endHH = String(h).padStart(2, '0') + ':00';
+    let d = new Date(from);
+    while (d <= to) {
+      const dk = localDateStr(d);
+      const hasLog = next.logs[dk] && next.logs[dk].sessions && next.logs[dk].sessions.length > 0;
+      if (!hasLog) {
+        next.logs[dk] = { sessions: [{ id: uid(), start: combineDateTime(dk, '00:00'), end: combineDateTime(dk, endHH) }] };
+      }
+      d.setDate(d.getDate() + 1);
+    }
+    persist(next);
+    setState({ showBackfill: false });
+  }
+
   function saveSettings(s) {
     persist(Object.assign({}, state.data, { settings: s }));
+    setState({ showSettings: false });
+  }
+
+  function saveSettingsAndTray(s, newTrayNumber, newStartDate) {
+    const data = state.data;
+    const trays = data.trays.slice();
+    const last = trays[trays.length - 1];
+    const patch = {};
+    if (Number(newTrayNumber) !== last.trayNumber) patch.trayNumber = Number(newTrayNumber);
+    if (newStartDate && newStartDate !== last.startDate) patch.startDate = newStartDate;
+    if (Object.keys(patch).length) trays[trays.length - 1] = Object.assign({}, last, patch);
+    persist(Object.assign({}, data, { settings: s, trays }));
     setState({ showSettings: false });
   }
 
@@ -420,10 +464,10 @@
               const isToday = d === today;
               let bg = '#F0EBE0';
               if (hasLog) bg = h >= goal ? '#2D6E68' : h >= goal * 0.6 ? '#E0B85C' : '#E0735C';
-              return `<div class="heat-cell">
+              return `<button class="heat-cell" data-view-day="${d}">
                 <div class="heat-sq ${isToday ? 'today' : ''}" style="background:${bg}" title="${esc(fmtDate(d))}: ${hasLog ? h.toFixed(1) + 'h' : 'no log'}"></div>
                 <span class="heat-day font-mono">${d.slice(8, 10)}</span>
-              </div>`;
+              </button>`;
             }).join('')}
           </div>
         </div>
@@ -431,15 +475,18 @@
         ${state.saveError ? `<p class="save-error">Couldn't save — your last change may not have synced.</p>` : ''}
       </div>
 
-      ${state.showSettings ? renderSettingsSheet(settings) : ''}
-      ${state.editingSession ? renderSessionSheet(state.editingSession === 'new' ? null : state.editingSession) : ''}
+      ${state.showSettings ? renderSettingsSheet(settings, currentTray) : ''}
+      ${state.editingSession ? renderSessionSheet(state.editingSession === 'new' ? null : state.editingSession, state.newSessionDate) : ''}
+      ${state.viewingDay ? renderDaySheet(state.viewingDay) : ''}
+      ${state.showBackfill ? renderBackfillSheet() : ''}
     `;
 
     root.innerHTML = html;
     attachHandlers();
   }
 
-  function renderSessionSheet(session) {
+  function renderSessionSheet(session, defaultDate) {
+    const dateVal = session ? dateKeyOf(session.start) : (defaultDate || todayStr());
     const startTime = session ? hhmmOf(session.start) : '08:00';
     const endTime = session && session.end ? hhmmOf(session.end) : '20:00';
     const stillIn = session ? session.end === null : false;
@@ -451,6 +498,9 @@
             <h2 class="font-serif sheet-title">${session ? 'Edit session' : 'Add session'}</h2>
             <button id="session-close" class="sheet-close">${ICONS.x}</button>
           </div>
+
+          <label class="field-label">Date</label>
+          <input type="date" id="session-date" class="time-input font-mono" value="${dateVal}" max="${todayStr()}" />
 
           <label class="field-label">Put in at</label>
           <input type="time" id="session-start" class="time-input font-mono" value="${startTime}" />
@@ -469,12 +519,17 @@
       </div>`;
   }
 
-  function renderSettingsSheet(settings) {
+  function renderSettingsSheet(settings, currentTray) {
     return `
       <div class="overlay" id="settings-overlay">
         <div class="sheet" id="settings-sheet">
           <div class="sheet-handle"></div>
           <h2 class="font-serif sheet-title" style="margin-bottom:20px">Plan settings</h2>
+
+          ${stepperRow('currentTrayNumber', 'Current tray number', currentTray.trayNumber, 1, 99)}
+
+          <label class="field-label">Current tray start date</label>
+          <input type="date" id="settings-tray-start" class="time-input font-mono" value="${currentTray.startDate}" max="${todayStr()}" />
 
           ${stepperRow('goalHours', 'Daily wear goal (hours)', settings.goalHours, 1, 24)}
           ${stepperRow('trayDurationDays', 'Days per tray', settings.trayDurationDays, 1, 30)}
@@ -482,6 +537,73 @@
 
           <button id="settings-save" class="primary-btn" style="margin-top:8px">Save</button>
           <button id="settings-cancel" class="cancel-btn" style="padding:12px 4px">Cancel</button>
+          <button id="settings-backfill" class="add-session-link" style="display:block;margin:12px auto 0">Backfill missing days</button>
+        </div>
+      </div>`;
+  }
+
+  function renderDaySheet(dateStr) {
+    const logs = state.data.logs;
+    const sessions = ((logs[dateStr] && logs[dateStr].sessions) || []).slice().sort((a, b) => new Date(a.start) - new Date(b.start));
+    const totalHours = hoursForDate(logs, dateStr, state.now);
+    return `
+      <div class="overlay" id="day-overlay">
+        <div class="sheet" id="day-sheet">
+          <div class="sheet-handle"></div>
+          <div class="sheet-head">
+            <h2 class="font-serif sheet-title">${esc(fmtDate(dateStr))}</h2>
+            <button id="day-close" class="sheet-close">${ICONS.x}</button>
+          </div>
+          <p style="font-size:14px;color:#6B6557;margin:-8px 0 16px">${totalHours.toFixed(1)}h logged</p>
+          ${sessions.length ? `<div style="margin-bottom:16px">
+            ${sessions.map((s) => `
+              <button class="session-row" data-edit-day-session="${s.id}">
+                <span class="font-mono session-time">${fmtTime(s.start)} – ${s.end ? fmtTime(s.end) : 'now'}</span>
+                <span class="session-right">
+                  <span class="font-mono">${(s.end ? durationHours(s.start, s.end) : durationHours(s.start, state.now)).toFixed(1)}h</span>
+                  ${ICONS.pencil}
+                </span>
+              </button>`).join('')}
+          </div>` : `<p style="font-size:14px;color:#9C9587;margin-bottom:16px">No sessions logged this day.</p>`}
+          <button id="day-add-session" class="primary-btn">+ Add session</button>
+          <button id="day-cancel" class="cancel-btn">Close</button>
+        </div>
+      </div>`;
+  }
+
+  function renderBackfillSheet() {
+    const settings = state.data.settings;
+    const defaultHours = state.backfillHours != null ? state.backfillHours : settings.goalHours;
+    const yesterday = daysAgoStr(1);
+    const defaultFrom = state.backfillFrom || '';
+    const defaultTo = state.backfillTo || yesterday;
+    return `
+      <div class="overlay" id="backfill-overlay">
+        <div class="sheet" id="backfill-sheet">
+          <div class="sheet-handle"></div>
+          <div class="sheet-head">
+            <h2 class="font-serif sheet-title">Backfill history</h2>
+            <button id="backfill-close" class="sheet-close">${ICONS.x}</button>
+          </div>
+          <p style="font-size:13px;color:#8A8478;margin:-8px 0 16px">Fills in an assumed wear session for each day in this range that has no logged data yet. Any day you've already logged is left untouched.</p>
+
+          <label class="field-label">From</label>
+          <input type="date" id="backfill-from" class="time-input font-mono" value="${defaultFrom}" max="${yesterday}" />
+
+          <label class="field-label">Through</label>
+          <input type="date" id="backfill-to" class="time-input font-mono" value="${defaultTo}" max="${yesterday}" />
+
+          <div class="stepper-row">
+            <span class="stepper-label">Assumed hours per day</span>
+            <div class="stepper-controls">
+              <button class="stepper-btn" id="backfill-hours-minus">${ICONS.minus}</button>
+              <span class="font-mono stepper-val" id="backfill-hours-val">${defaultHours}</span>
+              <button class="stepper-btn" id="backfill-hours-plus">${ICONS.plus}</button>
+            </div>
+          </div>
+
+          <button id="backfill-run" class="primary-btn" style="margin-top:8px">Fill in days</button>
+          <button id="backfill-cancel" class="cancel-btn">Cancel</button>
         </div>
       </div>`;
   }
@@ -509,7 +631,7 @@
     if (toggleBtn) toggleBtn.onclick = toggleWear;
 
     const addSessionBtn = $('#btn-add-session');
-    if (addSessionBtn) addSessionBtn.onclick = () => setState({ editingSession: 'new' });
+    if (addSessionBtn) addSessionBtn.onclick = () => setState({ editingSession: 'new', newSessionDate: null });
 
     const nextTrayBtn = $('#btn-next-tray');
     if (nextTrayBtn) nextTrayBtn.onclick = startNextTray;
@@ -537,9 +659,10 @@
       };
 
       $('#session-save').onclick = () => {
-        const startISO = combineTodayTime($('#session-start').value);
+        const dateStr = $('#session-date').value || todayStr();
+        const startISO = combineDateTime(dateStr, $('#session-start').value);
         const stillIn = $('#session-stillin').checked;
-        const endISO = stillIn ? null : combineTodayTime($('#session-end').value);
+        const endISO = stillIn ? null : combineDateTime(dateStr, $('#session-end').value);
         const session = state.editingSession === 'new' ? null : state.editingSession;
         saveSession({ id: session ? session.id : uid(), start: startISO, end: endISO });
       };
@@ -574,12 +697,72 @@
       $('#settings-save').onclick = () => {
         const rows = $$('.stepper-row');
         const s = {};
+        let trayNumber = null;
         rows.forEach((row) => {
-          s[row.getAttribute('data-field')] = Number(row.querySelector('[data-val]').textContent);
+          const field = row.getAttribute('data-field');
+          const val = Number(row.querySelector('[data-val]').textContent);
+          if (field === 'currentTrayNumber') trayNumber = val;
+          else s[field] = val;
         });
-        saveSettings(s);
+        const trayStartInput = $('#settings-tray-start');
+        const trayStart = trayStartInput ? trayStartInput.value : null;
+        saveSettingsAndTray(s, trayNumber, trayStart);
+      };
+
+      const backfillBtn = $('#settings-backfill');
+      if (backfillBtn) backfillBtn.onclick = () => setState({ showSettings: false, showBackfill: true });
+    }
+
+    // backfill sheet
+    const backfillOverlay = $('#backfill-overlay');
+    if (backfillOverlay) {
+      backfillOverlay.onclick = (e) => { if (e.target === backfillOverlay) setState({ showBackfill: false }); };
+      $('#backfill-sheet').onclick = (e) => e.stopPropagation();
+      $('#backfill-close').onclick = () => setState({ showBackfill: false });
+      $('#backfill-cancel').onclick = () => setState({ showBackfill: false });
+
+      const hoursVal = $('#backfill-hours-val');
+      $('#backfill-hours-minus').onclick = () => { hoursVal.textContent = Math.max(1, Number(hoursVal.textContent) - 1); };
+      $('#backfill-hours-plus').onclick = () => { hoursVal.textContent = Math.min(23, Number(hoursVal.textContent) + 1); };
+
+      $('#backfill-run').onclick = () => {
+        const from = $('#backfill-from').value;
+        const to = $('#backfill-to').value;
+        const hours = Number(hoursVal.textContent);
+        if (!from || !to) return;
+        runBackfill(from, to, hours);
       };
     }
+
+    // day-detail sheet
+    const dayOverlay = $('#day-overlay');
+    if (dayOverlay) {
+      dayOverlay.onclick = (e) => { if (e.target === dayOverlay) setState({ viewingDay: null }); };
+      $('#day-sheet').onclick = (e) => e.stopPropagation();
+      $('#day-close').onclick = () => setState({ viewingDay: null });
+      $('#day-cancel').onclick = () => setState({ viewingDay: null });
+
+      $('#day-add-session').onclick = () => {
+        const day = state.viewingDay;
+        setState({ editingSession: 'new', newSessionDate: day, viewingDay: null });
+      };
+
+      $$('[data-edit-day-session]').forEach((btn) => {
+        btn.onclick = () => {
+          const id = btn.getAttribute('data-edit-day-session');
+          const all = allSessions(state.data.logs);
+          const s = all.find((x) => x.id === id);
+          if (s) setState({ editingSession: s, viewingDay: null });
+        };
+      });
+    }
+
+    $$('[data-view-day]').forEach((btn) => {
+      btn.onclick = () => {
+        const day = btn.getAttribute('data-view-day');
+        setState({ viewingDay: day });
+      };
+    });
   }
 
   init();
